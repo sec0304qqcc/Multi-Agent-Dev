@@ -1,0 +1,233 @@
+version: '3.8'
+
+services:
+  # Redis - Message Queue and Caching
+  redis:
+    image: redis:7-alpine
+    container_name: multi-agent-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # PostgreSQL - Primary Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: multi-agent-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-multi_agent_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-agent_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agent_user} -d ${POSTGRES_DB:-multi_agent_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Agent Coordinator - Core Orchestration Service
+  agent-coordinator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.coordinator
+    container_name: multi-agent-coordinator
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-agent_user}:${POSTGRES_PASSWORD:-secure_password_change_me}@postgres:5432/${POSTGRES_DB:-multi_agent_dev}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./agents/coordinator/workspace:/app/workspace
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Frontend Agent Service
+  frontend-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      args:
+        AGENT_TYPE: frontend
+    container_name: multi-agent-frontend
+    environment:
+      - REDIS_URL=redis://redis:6379/1
+      - COORDINATOR_URL=http://agent-coordinator:8000
+      - AGENT_ID=frontend-001
+      - AGENT_ROLE=frontend-developer
+    volumes:
+      - ./agents/frontend/workspace:/app/workspace
+      - ./agents/frontend/templates:/app/templates:ro
+    depends_on:
+      - agent-coordinator
+    restart: unless-stopped
+
+  # Backend Agent Service
+  backend-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      args:
+        AGENT_TYPE: backend
+    container_name: multi-agent-backend
+    environment:
+      - REDIS_URL=redis://redis:6379/2
+      - COORDINATOR_URL=http://agent-coordinator:8000
+      - AGENT_ID=backend-001
+      - AGENT_ROLE=backend-developer
+    volumes:
+      - ./agents/backend/workspace:/app/workspace
+      - ./agents/backend/templates:/app/templates:ro
+    depends_on:
+      - agent-coordinator
+    restart: unless-stopped
+
+  # Testing Agent Service
+  testing-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      args:
+        AGENT_TYPE: testing
+    container_name: multi-agent-testing
+    environment:
+      - REDIS_URL=redis://redis:6379/3
+      - COORDINATOR_URL=http://agent-coordinator:8000
+      - AGENT_ID=testing-001
+      - AGENT_ROLE=testing-specialist
+    volumes:
+      - ./agents/testing/workspace:/app/workspace
+      - ./agents/testing/templates:/app/templates:ro
+    depends_on:
+      - agent-coordinator
+    restart: unless-stopped
+
+  # DevOps Agent Service
+  devops-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      args:
+        AGENT_TYPE: devops
+    container_name: multi-agent-devops
+    environment:
+      - REDIS_URL=redis://redis:6379/4
+      - COORDINATOR_URL=http://agent-coordinator:8000
+      - AGENT_ID=devops-001
+      - AGENT_ROLE=devops-specialist
+    volumes:
+      - ./agents/devops/workspace:/app/workspace
+      - ./agents/devops/templates:/app/templates:ro
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker operations
+    depends_on:
+      - agent-coordinator
+    restart: unless-stopped
+
+  # Monitoring - Prometheus
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: multi-agent-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+
+  # Monitoring - Grafana
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: multi-agent-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Web Interface (Optional)
+  web-interface:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: multi-agent-web
+    ports:
+      - "3001:80"
+    environment:
+      - API_URL=http://agent-coordinator:8000
+      - WEBSOCKET_URL=ws://agent-coordinator:8000/ws
+    depends_on:
+      - agent-coordinator
+    restart: unless-stopped
+
+  # n8n Workflow Automation (Optional)
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: multi-agent-n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-admin}
+      - WEBHOOK_URL=http://localhost:5678/
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./orchestration/n8n/workflows:/home/node/.n8n/workflows:ro
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  n8n_data:
+    driver: local
+
+networks:
+  default:
+    name: multi-agent-network
+    driver: bridge
